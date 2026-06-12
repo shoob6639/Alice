@@ -18,7 +18,20 @@
 
 function Read_Message {
     $UserID = [array]::IndexOf($Users, $Sender)
+    $MailboxLocation = "$pwd\users\$UserID\mailbox"
 
+    $MailboxItems = Get-ChildItem "$MailboxLocation"
+
+    Write-Host "You Have" (Get-ChildItem -Path "$MailboxLocation").Count "Messages."
+
+    $i = 0
+    $MailboxItems | ForEach-Object {
+        [PSCustomObject]@{
+            Index        = $i++
+            Name         = $_.Name
+            CreationTime = $_.CreationTime
+        }
+    } | Format-Table
 }
 
 function Send_Message {
