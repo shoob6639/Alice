@@ -1,5 +1,19 @@
 
 $Users = @()
+function Init_PKI {
+    if ((Test-Path "ssl\root-ca\root_ca.pem") -and (Test-Path "ssl\root-ca\root_ca.crt") -and (Test-Path "ssl")) {
+        Write-Host "PKI init success."
+        Function_Select
+    } else {
+        $local:Selection = Read-Host "PKI malformed or not present. Would you like to view the PKI build tool? YES or NO"
+        if($Selection -eq "YES"){
+            .\BuildPKI.ps1
+        } else {
+            Write-Host "Exiting."
+        }
+    }   
+}
+
 function Send_Message {
     function Choose_Recipient {
     #Confirm users file exists before we start so the whole script doesn't explode
@@ -31,7 +45,8 @@ function Send_Message {
             MessageFile = ""
             SignatureName = ""
             SignatureFile = ""
-            PublicKey = ""
+            Encrypted = ""
+            Certificate = ""
 
         }
 
@@ -41,7 +56,6 @@ function Send_Message {
         $local:NewMessage.Recipient = $Recipient.UserName
         $local:NewMessage.Message = Read-Host "What would you like to say to $($NewMessage.Recipient)?"
         $local:NewMessage.MessageSubject = Read-Host "About What? (Subject)"
-
         $local:RecipientMailbox = "users\$($Recipient.UserID)\mailbox"
 
         $local:NewMessage.MessageName = "$($Recipient.UserID)" + "_" + "$($SessionToken.UserID)" + "_" + (Get-Date -Format "MM_dd_yyyy_HH_mm_ss") + ".json"
@@ -70,12 +84,41 @@ function Send_Message {
     
     #Check if the mailbox exists and is working before doing anything more.
     if (Test-Path "users\$($Recipient.UserID)\mailbox") {
+    
+        $local:ToEncrypt = Read-Host "Would you like to encrypt the contents of this message? YES or NO"
+        if($ToEncrypt = "YES"){
+            Write-Host "Encrypt the message."
+            $local:NewMessage.Encrypted = "TRUE"
+        } elseif ($ToEncrypt = "NO") {
+            $local:NewMessage.Encrypted = "FALSE"
+            Write-Host "Don't encrypt the message."
+        } else {
+            $local:NewMessage.Encrypted = "FALSE"
+        }
 
-        #Create the message file and sign it. Set the public key field, so people know which key can be used to verify it.
-        $NewMessage.PublicKey = $MessageSender.PublicKey
+        $NewMessage.Certificate = $MessageSender.Certificate
+
+        #Encrypt the message if it's requested. Essentially, pull the "Message" field out of the NewMessage object, encrypt THAT, and then shove it back into the message JSON later.
+        #OpenSSL is really picky about inputs and I can't pipe variables directly in (At least to my understanding), so I need to create temp files, do my operations and then pipe them back in.
+        if($NewMessage.Encrypted -eq "TRUE"){
+            
+            $local:UnencryptedFile = "$env:TEMP\message.txt"
+            $local:EncryptedFile = "$env:TEMP\message_enc.bin"
+
+            Set-Content -Path "$env:TEMP\message.txt" -Value $NewMessage.message
+            openssl pkeyutl -encrypt -certin -inkey $NewMessage.Certificate -in $UnencryptedFile -out $EncryptedFile
+
+            $NewMessage.Message = [System.IO.File]::ReadAllBytes($EncryptedFile)
+            Write-Host "Message encryption complete."
+  
+        }
+
+        #Create the message file and sign it. Set the certificate key field on the json object, so people know which cert can be used to verify it.
         Out-File  -FilePath $($NewMessage.MessageFile)
         $NewMessage | ConvertTo-Json |  Set-Content $($NewMessage.MessageFile)
         openssl dgst -sha256 -sign $MessageSender.PrivateKey -out $NewMessage.SignatureFile $NewMessage.MessageFile
+
+        
 
         #Check if it worked.
         if (Test-Path $NewMessage.SignatureFile) {
@@ -94,6 +137,22 @@ function Send_Message {
     $Newmessage = $null
 }
 
+function Validate_Certificate {
+    param(
+    [object]$User
+    )
+    if ($User.Certificate) {
+        $Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new((Join-Path $PSScriptRoot $User.Certificate.Trim())) 
+        if($Cert.NotAfter -gt (Get-Date)){
+            Return "VALID"
+        } else {
+            Return "INVALID"
+        }
+
+    } else {
+        Write-Host "Certificate is not present."
+        }   
+}
 
 function Read_Message {
 
@@ -115,8 +174,10 @@ function Read_Message {
         
         $Local:Message = @(Get-Content "$($_.FullName)" | ConvertFrom-Json | ForEach-Object { $_ }) 
         
-        #Check SSL signing with OpenSSL. $Messages object contains info like where the public key for this message lives and the signature. Suppress errors.
-        $Local:MessageVerified = openssl dgst -sha256 -verify $Message.PublicKey -signature $Message.SignatureFile $Message.MessageFile 2> $null
+        #Check SSL signing with OpenSSL. OpenSSL doesn't like outputs being piped in directly, so we need to crack the cert for the public .PEM, and then feed that into the verify command.
+        $Local:PubKey = openssl x509 -pubkey -noout -in $Message.Certificate
+        Set-Content -Path "$env:TEMP\pubkey.pem" -Value $PubKey
+        $Local:MessageVerified = openssl dgst -sha256 -verify $env:TEMP\pubkey.pem -signature $Message.SignatureFile $Message.MessageFile
 
         if($MessageVerified -eq "Verified OK"){
         } else {
@@ -129,11 +190,10 @@ function Read_Message {
             Time_Sent = $Message.SentTime
             Subject         = $Message.MessageSubject
             Message_Verified = $MessageVerified
+            Message_Encrypted = $Message.Encrypted
             
         }
     } | Format-Table -AutoSize
-
-    Main_Menu
 
 }
 
@@ -163,7 +223,17 @@ function Login {
     $local:Password = Read-Host "Please Enter Password: "
 
     if ($Password -eq $User.Password){
+        
         Issue_Token -UserID $User.UserID -Username $User.Username -Lifetime 5
+
+        #Check the user's certificate while we're at it.
+        if ((Validate_Certificate -User $User) -eq "VALID"){
+        } else {
+            Write-Host (Validate_Certificate -User $User)
+            Write-Host "You need a new keypair. Let's make one."
+            Generate_Keypair -User $User
+        } 
+        
         Main_Menu
     } elseif ($Password -ne $User.Password){
             $local:Selection = Read-Host "Password invalid. Would you like to try to login again? YES or NO?"
@@ -178,7 +248,6 @@ function Login {
     
     $Password = ""
     $Username = ""
-
     Main_Menu
 
 }
@@ -197,13 +266,12 @@ function Issue_Token {
             IssuedTime = (Get-Date).addMinutes(0)
             ValidUntil = (Get-Date).addMinutes($Lifetime)
         } 
-
+    
     Write-Host "Token issued successfully. Valid until $($SessionToken.ValidUntil)"   
 
 }
 
 function Validate_Token{
-
     #Check and see if a token has expired yet
     if ($SessionToken.ValidUntil -gt (Get-Date)){
         return "VALID" 
@@ -212,7 +280,34 @@ function Validate_Token{
         return "INVALID" 
     }
 }
+function Generate_Keypair {
+    param(
+    [object]$User
+    )
 
+    #Generate a new private key and certficate for this user.
+    $Local:CertPath = "ssl\$($User.UserID)\$(Get-Date -Format "MM_dd_yyyy")"
+
+    New-Item -ItemType "Directory"  -Path $CertPath\private > $null 2>&1
+    $User.PrivateKey = "$CertPath\private\private_key.pem"
+    openssl genrsa -out $User.PrivateKey 2048 
+
+    $local:CSR = "$($CertPath)\user_cert.csr"
+    openssl req -new -subj "/CN=$($User.Username)" -key $User.PrivateKey -out $CSR 
+
+    $User.Certificate = "$($CertPath)\user_cert.crt"
+    openssl x509 -req  -days 30 -in $CSR -CA "ssl\root-ca\root_ca.crt" -CAkey "ssl\root-ca\root_ca.pem" -out $User.Certificate -sha256 2> $null
+
+    #Check to make sure this actually worked.
+    if ((Test-Path $User.Certificate) -and (Test-Path $User.PrivateKey)) {
+        Write-Host "Keypair generated and signed successfully."
+        Remove-Item -Path $CSR
+    } else {
+        Write-Host "Keypair generation failed. Please try again."
+        $null = $User
+        Function_Select
+    }  
+}
 function Generate_User {
         #Confirm users file exists before we start so the whole script doesn't explode
         if (Test-Path "users.json") {
@@ -220,14 +315,13 @@ function Generate_User {
         } else {
             $Users = @()
         }
-        Build our new user object
+        #Build our new user object
         $NewUser = [PSCustomObject]@{
             UserID = $Users.Count
             Username = ""
             Password = ""
             PrivateKey = ""
-            PublicKey =  ""
-            Mailbox = ""
+            Certificate =  ""
             DateRegistered = Get-Date -Format "MM_dd_yyyy"
             TimeRegistered = Get-Date -Format "HH_mm_ss"
             
@@ -268,25 +362,19 @@ function Generate_User {
     New_Password
 
     #Create a keys directory for the user, and a mailbox. Check if they already have a mailbox, if they do for some reason.
-    New-Item -ItemType "Directory"  -Path users\$($NewUser.UserID)\keys | Out-Null
+    New-Item -ItemType "Directory"  -Path ssl\$($NewUser.UserID)\ > $null 2>&1
     
     if (Test-Path users\$($NewUser.UserID)\mailbox) {
-            Write-Host "Mailbox exists already? Skipping."
-        } else {
-            Write-Host "Mailbox does not exist. Creating one!"
-            New-Item -ItemType "Directory"  -Path users\$($NewUser.UserID)\mailbox | Out-Null
-        }  
+        Write-Host "Mailbox exists already? Skipping."
+    } else {
+        Write-Host "Mailbox does not exist. Creating one!"
+        New-Item -ItemType "Directory"  -Path users\$($NewUser.UserID)\mailbox > $null 2>&1
+    }  
 
-
-    #Generate a keypair for this user.
-    openssl genrsa -out $("users\$($NewUser.UserID)\keys\private_key.pem") 2048
-    $NewUser.PrivateKey = $("users\$($NewUser.UserID)\keys\private_key.pem")
-    
-    openssl rsa -in $NewUser.PrivateKey -out $("users\$($NewUser.UserID)\keys\public_key.pem") -outform PEM -pubout 
-    $NewUser.PublicKey = $("users\$($NewUser.UserID)\keys\public_key.pem")
+    Generate_Keypair -User $NewUser
 
     $Users += $NewUser
-    $Users | ConvertTo-Json -Depth 2 |  Set-Content users.json
+    $Users | ConvertTo-Json |  Set-Content users.json
 
     $null = $NewUser
     Function_Select
@@ -335,4 +423,4 @@ function Main_Menu {
     }
 }
 
-Function_Select
+Init_PKI
