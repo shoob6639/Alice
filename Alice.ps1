@@ -84,41 +84,41 @@ function Send_Message {
     
     #Check if the mailbox exists and is working before doing anything more.
     if (Test-Path "users\$($Recipient.UserID)\mailbox") {
-    
+		
+		$NewMessage.Certificate = $MessageSender.Certificate
+		
         $local:ToEncrypt = Read-Host "Would you like to encrypt the contents of this message? YES or NO"
-        if($ToEncrypt = "YES"){
-            Write-Host "Encrypt the message."
+        if($ToEncrypt -eq "YES"){
+			
             $local:NewMessage.Encrypted = "TRUE"
-        } elseif ($ToEncrypt = "NO") {
-            $local:NewMessage.Encrypted = "FALSE"
-            Write-Host "Don't encrypt the message."
-        } else {
-            $local:NewMessage.Encrypted = "FALSE"
-        }
-
-        $NewMessage.Certificate = $MessageSender.Certificate
-
-        #Encrypt the message if it's requested. Essentially, pull the "Message" field out of the NewMessage object, encrypt THAT, and then shove it back into the message JSON later.
-        #OpenSSL is really picky about inputs and I can't pipe variables directly in (At least to my understanding), so I need to create temp files, do my operations and then pipe them back in.
-        if($NewMessage.Encrypted -eq "TRUE"){
+			
+			#Encrypt the message if it's requested. Essentially, pull the "Message" field out of the NewMessage object, encrypt THAT, and then shove it back into the message JSON later.
+			#OpenSSL is really picky about inputs and I can't pipe variables directly in (At least to my understanding), so I need to create temp files, do my operations and then pipe them back in.
+    
             
             $local:UnencryptedFile = "$env:TEMP\message.txt"
             $local:EncryptedFile = "$env:TEMP\message_enc.bin"
 
             Set-Content -Path "$env:TEMP\message.txt" -Value $NewMessage.message
-            openssl pkeyutl -encrypt -certin -inkey $NewMessage.Certificate -in $UnencryptedFile -out $EncryptedFile
+            openssl pkeyutl -encrypt -certin -inkey $NewMessage.Certificate -in $UnencryptedFile -out $EncryptedFile 
 
             $NewMessage.Message = [System.IO.File]::ReadAllBytes($EncryptedFile)
             Write-Host "Message encryption complete."
-  
+			
+        } elseif ($ToEncrypt -eq "NO") {
+			
+            $local:NewMessage.Encrypted = "FALSE"
+			
+        } else {
+			
+            $local:NewMessage.Encrypted = "FALSE"
+			
         }
 
         #Create the message file and sign it. Set the certificate key field on the json object, so people know which cert can be used to verify it.
         Out-File  -FilePath $($NewMessage.MessageFile)
         $NewMessage | ConvertTo-Json |  Set-Content $($NewMessage.MessageFile)
-        openssl dgst -sha256 -sign $MessageSender.PrivateKey -out $NewMessage.SignatureFile $NewMessage.MessageFile
-
-        
+        openssl dgst -sha256 -sign $MessageSender.PrivateKey -out $NewMessage.SignatureFile $NewMessage.MessageFile        
 
         #Check if it worked.
         if (Test-Path $NewMessage.SignatureFile) {
@@ -138,35 +138,126 @@ function Send_Message {
 }
 
 function Validate_Certificate {
+	
     param(
     [object]$User
     )
+	
     if ($User.Certificate) {
+		
         $Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new((Join-Path $PSScriptRoot $User.Certificate.Trim())) 
         if($Cert.NotAfter -gt (Get-Date)){
+			
             Return "VALID"
+			
         } else {
+			
             Return "INVALID"
+			
         }
 
     } else {
+		
         Write-Host "Certificate is not present."
+		
         }   
 }
 
-function Read_Message {
+function Read_Messages {
+	
+	cls
+	$Selection = ""
+	
+	#Message selection menu logic. If it's "" or null, ask for an index. If it's in the array, open the message. If it's neither, ask for input again.
+	function Select_Message {
+		
+		Write-Host $selection
+		if ($Selection -eq "exit"){
+			
+			$Selection = ""
+			Main_Menu
+			
+			
+		} elseif (($Selection -eq "") -or ($Selection -eq $null)) {
+			
+			$Selection =  Read-Host "Welcome Back $($SessionToken.Username). Please input the index of a message you would like to view, or 'EXIT'"
+			Select_Message
+			
+		} elseif($Selection = $MessageArray | Where-Object { $_.Index -eq $Selection } | Select-Object ) {
+			
+			Open_Message -Message $Selection
+			Selection = ""
+			
+		} else {
+			
+			$Selection = Read-Host "Selection not found. Please input the index of the message you would like to view, or 'EXIT'"
+			Select_Message
+			
+		} 
+	}
 
+	function Open_Message {
+		param(
+        [object]$Message
+		)
+		
+		cls
+		
+		Write-Host "From: $($Message.From)"
+		Write-Host "To: $($Message.To)"
+		Write-Host "Subject: $($Message.Subject)"
+		Write-Host "Message Sent: $($Message.Time_Sent)"
+		
+		if($Message.Message_Verified -eq "Verified OK"){
+			Write-Host "Message Verified OK" -ForegroundColor "Green"
+		} else {
+			Write-Host "Message Verification FAIL" -ForegroundColor "Red"
+		}
+		
+		if($Message.Message_Encrypted -eq "TRUE"){
+			Write-Host "Message Encrypted" -ForegroundColor "Cyan"
+			
+            $local:EncryptedFile = "$env:TEMP\message_enc.bin"
+            $EncryptedFile = [System.IO.File]::ReadAllBytes($EncryptedFile)
+			
+			$local:UnencryptedFile = "$env:TEMP\message.txt"
+			$local:CurrentUser = $Users | Where-Object { $_.Username -eq $SessionToken.UserName} | Select-Object
+			
+			openssl pkeyutl -decrypt -in $EncryptedFile -out $UnencryptedFile -inkey $CurrentUser.PrivateKey > $null 2>&1
+			
+			$Message.Message = Get-Content $UnencryptedFile
+			
+		} else {
+		}
+		
+		Write-Host ""
+		Write-Host $($Message.Message) 
+		
+		$local:Selection = Read-Host "When finished, type 'exit'"
+	
+		if ($local:Selection = "EXIT"){
+			Read_Messages
+		}
+		
+	}
+	
+	
     #Validate Session Token before starting
-    if (Validate_Token -eq "VALID"){        
+    if (Validate_Token -eq "VALID"){      
+
     } else {
+		
         Write-Host "Session Token Invalid. Please login again."
         Function_Select
         return $null
+		
     }
-
-    #Set $Messages to an array containing all the .json message files in our mailbox
+ 
+    #Set $Messages to an array containing all the .json message files in our mailbox. Initialize $MessageArray. Reset $I
+	$i = 0
+	$local:Messages = @() 
     $local:Messages = @(Get-ChildItem "users\$($SessionToken.UserID)\mailbox\*.json")
-    
+    $local:MessageArray = @()
     Write-Host "You Have" $Messages.Count "Messages."
     
     #Go through each message in $Messages and pull data from them to display to the terminal.
@@ -183,7 +274,9 @@ function Read_Message {
         } else {
             $MessageVerified = "Verfied FAIL"
         }
-        [PSCustomObject]@{
+		
+		#Get a PSCustomObject for each message.
+        $Local:MessageObject = [PSCustomObject]@{
             Index        = $i++
             From = $Message.Sender
             To = $Message.Recipient
@@ -191,32 +284,56 @@ function Read_Message {
             Subject         = $Message.MessageSubject
             Message_Verified = $MessageVerified
             Message_Encrypted = $Message.Encrypted
-            
         }
+		
+		$local:MessageObject
+		
+		#Construct $MessageArray out of these objects. This is done AFTER displaying them in the list, so the MessageObject we use later isn't displayed with the message, but has it tacked on after.
+		$MessageObject | Add-Member -NotePropertyName "Message" -NotePropertyValue "$($Message.Message)"
+		$Local:MessageArray += $MessageObject
+		
     } | Format-Table -AutoSize
-
+	
+	Select_Message
+	$i = 0
+	
+	
 }
 
 function Login {
+	
+	$Selection = ""
+	
     #Confirm users file exists before we start so the whole script doesn't explode
     if (Test-Path "users.json") {
+		
             $Users = @(Get-Content "users.json" -Raw | ConvertFrom-Json | ForEach-Object { $_ })
+			
         } else {
+			
             $Users = @()
         }
+		
     
     #Ask for a username, and make sure it exists in the database before proceeding
     $local:Username = Read-Host "Please Enter Username:"
 
     if ($local:User = $Users | Where-Object { $_.Username -eq $Username } | Select-Object ){
     } else {
+		
         $local:Selection = Read-Host "User not found. Would you like to try to login again? YES or NO?"
+		
         if ($Selection -eq "YES"){
+			
+			$Selection = ""
             Login
+			
         } elseif ($Selection = "NO"){
+			
+			$Selection = ""
             Function_Select
+			
         }
-
     } 
     
     #Ask for a password, verify it. If it's good, issue a session token.
@@ -225,13 +342,16 @@ function Login {
     if ($Password -eq $User.Password){
         
         Issue_Token -UserID $User.UserID -Username $User.Username -Lifetime 5
+		$Selection = ""
 
         #Check the user's certificate while we're at it.
         if ((Validate_Certificate -User $User) -eq "VALID"){
         } else {
+			
             Write-Host (Validate_Certificate -User $User)
             Write-Host "You need a new keypair. Let's make one."
             Generate_Keypair -User $User
+		
         } 
         
         Main_Menu
@@ -239,15 +359,18 @@ function Login {
             $local:Selection = Read-Host "Password invalid. Would you like to try to login again? YES or NO?"
             if ($Selection -eq "YES"){
                 Login
-                $null = $Selection
+                $Selection = ""
             } elseif ($Selection = "NO"){
                 Function_Select
-                $null = $Selection
+                $Selection = ""
             }
         }
     
     $Password = ""
     $Username = ""
+	
+	$null = $Selection
+	
     Main_Menu
 
 }
@@ -266,12 +389,16 @@ function Issue_Token {
             IssuedTime = (Get-Date).addMinutes(0)
             ValidUntil = (Get-Date).addMinutes($Lifetime)
         } 
-    
-    Write-Host "Token issued successfully. Valid until $($SessionToken.ValidUntil)"   
+	
+    $Selection = ""
+	Write-Host $Selection
+    Write-Host "Token issued successfully. Valid until $($SessionToken.ValidUntil)" 
+	
+	cls
 
 }
 
-function Validate_Token{
+function Validate_Token {
     #Check and see if a token has expired yet
     if ($SessionToken.ValidUntil -gt (Get-Date)){
         return "VALID" 
@@ -381,46 +508,57 @@ function Generate_User {
 }
 
 function Function_Select {
-    $null = $Selection
-    $local:Selection = Read-Host "Welcome to SSL Message Mailbox. LOGIN or REGISTER."
-
-    if($Selection -eq "LOGIN")
-    {
-        Login
-        $Selection = $null
-        
-    }
-    elseif ($Selection -eq "REGISTER")
-    {
+	
+    if($Selection -eq "login") {
+		
+        $Selection = ""
+		Login
+		
+    } elseif ($Selection -eq "REGISTER") {
+		
+        $Selection = ""		
         Generate_User
-        $Selection = $null
-    }     
-    else
-    {
+
+		
+    } elseif (($Selection -eq "") -or ($Selection -eq $null)) {
+		
+		$Selection = Read-Host "Welcome to SSL Message Mailbox. LOGIN or REGISTER."
+		Function_Select
+		
+	} else {
+		
         $Selection = Read-Host "Selection not recognized. Please LOGIN or REGISTER."
+		$Selection = ""
         Function_Select
-    }
+		
+	}
 }
 
 function Main_Menu {
-    $null = $Selection
-    $Selection = Read-Host "Welcome Back $($SessionToken.Username). Would you like to READ or SEND a message?"
-
-    if ($Selection -eq "Read")
-    {
-        Read_Message
-        $Selection = $null
-    }
-    if ($Selection -eq "Send")
-    {
+	
+	if($Selection -eq "Read") {
+		
+		$Selection = ""
+        Read_Messages
+		
+    } elseif($Selection -eq "Send") {
+		
+		$Selection = ""
         Send_Message
-        $Selection = $null
-    }     
-    else
-    {
-        $Selection = Read-Host "Selection not recognized. Please READ or SEND."
+		
+	} elseif (($Selection -eq "") -or ($Selection -eq $null)) {
+		
+		$Selection =  Read-Host "Welcome Back $($SessionToken.Username). Would you like to READ or SEND a message?"
+		Main_Menu
+		
+	} else {
+		
+        $Selection = Read-Host "Selection not recognized. Please READ or SEND a message."
+		$Selection = ""
         Main_Menu
-    }
+		
+	}
 }
 
 Init_PKI
+$Selection = ""
